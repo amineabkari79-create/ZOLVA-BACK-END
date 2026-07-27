@@ -64,10 +64,23 @@ async function reverseGeocode(lat, lon) {
 
 // --- Route : lancer une recherche pour une ville et stocker les résultats ---
 app.post('/api/scan', async (req, res) => {
-  const { ville } = req.body;
+  const { ville, force } = req.body;
   if (!ville) return res.status(400).json({ error: 'Le paramètre "ville" est requis' });
 
   try {
+    // Si cette zone a déjà été scannée récemment, on ne refait pas tout le travail —
+    // on renvoie directement ce qui est déjà en base (rapide).
+    if (!force) {
+      const { count } = await supabase
+        .from('prospects')
+        .select('*', { count: 'exact', head: true })
+        .ilike('zone_recherche', ville);
+
+      if (count && count > 0) {
+        return res.json({ dejaScanne: true, enBase: count, message: 'Zone déjà scannée, données existantes utilisées' });
+      }
+    }
+
     const elements = await chercherPiscines(ville);
     let ajoutes = 0;
     let ignores = 0;
