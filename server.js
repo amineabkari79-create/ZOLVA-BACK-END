@@ -107,7 +107,7 @@ app.get('/api/prospects', async (req, res) => {
   const { ville, limit = 50 } = req.query;
 
   let q = supabase.from('prospects').select('*').order('created_at', { ascending: false }).limit(Number(limit));
-  if (ville) q = q.ilike('ville', `%${ville}%`);
+  if (ville) q = q.or(`ville.ilike.%${ville}%,zone_recherche.ilike.%${ville}%`);
 
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
