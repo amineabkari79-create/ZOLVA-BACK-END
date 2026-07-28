@@ -280,5 +280,184 @@ app.post('/api/chat-widget', async (req, res) => {
   }
 });
 
+// ============================================================
+// ENVOI RÉEL — email (Resend) et SMS (Twilio)
+// ============================================================
+async function envoyerEmail(to, subject, body) {
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY non configurée');
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + process.env.RESEND_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: 'Zolva <onboarding@resend.dev>',
+      to: [to],
+      subject,
+      html: body.replace(/\n/g, '<br>')
+    })
+  });
+  if (!res.ok) throw new Error('Resend a répondu ' + res.status + ': ' + await res.text());
+  return await res.json();
+}
+
+async function envoyerSMS(to, body) {
+  if (!process.env.TWILIO_SID || !process.env.TWILIO_TOKEN || !process.env.TWILIO_FROM) {
+    throw new Error('Variables Twilio non configurées (TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM)');
+  }
+  const auth = Buffer.from(process.env.TWILIO_SID + ':' + process.env.TWILIO_TOKEN).toString('base64');
+  const params = new URLSearchParams({ To: to, From: process.env.TWILIO_FROM, Body: body });
+  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + auth,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: params
+  });
+  if (!res.ok) throw new Error('Twilio a répondu ' + res.status + ': ' + await res.text());
+  return await res.json();
+}
+
+// --- Route : envoi manuel d'un email (bouton "Envoyer" côté app) ---
+app.post('/api/send-email', async (req, res) => {
+  const { to, subject, body } = req.body;
+  if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject et body sont requis' });
+  try {
+    await envoyerEmail(to, subject, body);
+    res.json({ envoye: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Route : envoi manuel d'un SMS ---
+app.post('/api/send-sms', async (req, res) => {
+  const { to, body } = req.body;
+  if (!to || !body) return res.status(400).json({ error: 'to et body sont requis' });
+  try {
+    await envoyerSMS(to, body);
+    res.json({ envoye: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// RELANCES AUTOMATIQUES
+// ============================================================
+
+// --- Activer le suivi automatique pour un prospect ---
+app.post('/api/relances/activer', async (req, res) => {
+  const { prospect_local_id, nom, tel, email, canal_prefere, ville, date_contact } = req.body;
+  if (!prospect_local_id) return res.status(400).json({ error: 'prospect_local_id requis' });
+  if (!tel && !email) return res.status(400).json({ error: 'Un téléphone ou un email est requis pour automatiser les relances' });
+
+  const { error } = await supabase.from('relances_auto').upsert({
+    prospect_local_id, nom, tel, email,
+    canal_prefere: canal_prefere || (tel ? 'sms' : 'email'),
+    ville,
+    date_contact: date_contact || new Date().toISOString().slice(0, 10),
+    step: 'j1',
+    statut: 'actif'
+  }, { onConflict: 'prospect_local_id' });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ active: true });
+});
+
+// --- Désactiver le suivi automatique ---
+app.post('/api/relances/desactiver', async (req, res) => {
+  const { prospect_local_id } = req.body;
+  if (!prospect_local_id) return res.status(400).json({ error: 'prospect_local_id requis' });
+  const { error } = await supabase.from('relances_auto').update({ statut: 'desactive' }).eq('prospect_local_id', prospect_local_id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ desactive: true });
+});
+
+// --- Lister les prospects sous suivi automatique (pour affichage dans l'app) ---
+app.get('/api/relances/liste', async (req, res) => {
+  const { data, error } = await supabase.from('relances_auto').select('*').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// --- Générer un message de relance via Claude (réutilisé par le job auto) ---
+async function genererMessageRelance(step, prospect) {
+  const prompts = {
+    j1: `Tu es Thomas, setter piscine terrain. Rédige un message de relance J+1 ultra-naturel pour ${prospect.nom || 'le prospect'}. Il a été contacté récemment pour un projet piscine et n'a pas répondu. Style humain, pas commercial, comme si tu vérifies juste qu'il a bien reçu. 3-4 phrases max. Réponds uniquement avec le message, sans lien ni signature.`,
+    j2: `Tu es Thomas, setter piscine terrain. Rédige un message de relance J+2 pour ${prospect.nom || 'le prospect'}. Utilise une preuve sociale : un témoignage fictif mais réaliste d'un propriétaire satisfait dans la région de ${prospect.ville || 'sa région'}. 4-5 phrases max. Réponds uniquement avec le message.`,
+    j3: `Tu es Thomas, setter piscine terrain. Rédige le dernier message de relance J+3 pour ${prospect.nom || 'le prospect'}. Créé une urgence réelle sur la saison de construction. Ton direct mais respectueux. 4 phrases max. Réponds uniquement avec le message.`
+  };
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configurée');
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 400,
+      messages: [{ role: 'user', content: prompts[step] }]
+    })
+  });
+  if (!resp.ok) throw new Error('Anthropic a répondu ' + resp.status);
+  const data = await resp.json();
+  return data.content[0].text;
+}
+
+// --- Job quotidien : à déclencher par un service de cron externe (ex: cron-job.org) ---
+app.post('/api/relances/run', async (req, res) => {
+  try {
+    const { data: actifs, error } = await supabase.from('relances_auto').select('*').eq('statut', 'actif');
+    if (error) throw error;
+
+    const nextStep = { j1: 'j2', j2: 'j3', j3: null };
+    const delaiJours = { j1: 1, j2: 2, j3: 3 }; // jours depuis date_contact avant de déclencher chaque étape
+    let traites = 0, envoyes = 0, erreurs = 0;
+
+    for (const p of actifs) {
+      const refDate = new Date(p.date_contact);
+      const joursEcoules = Math.floor((Date.now() - refDate.getTime()) / 86400000);
+      const seuil = delaiJours[p.step];
+
+      // Pas encore l'heure de cette étape, ou déjà relancé aujourd'hui
+      if (joursEcoules < seuil) continue;
+      if (p.derniere_relance && new Date(p.derniere_relance).toDateString() === new Date().toDateString()) continue;
+
+      traites++;
+      try {
+        const message = await genererMessageRelance(p.step, p);
+        if (p.canal_prefere === 'sms' && p.tel) {
+          await envoyerSMS(p.tel, message);
+        } else if (p.email) {
+          await envoyerEmail(p.email, 'Votre projet piscine', message);
+        } else {
+          throw new Error('Aucun canal disponible');
+        }
+
+        const suivant = nextStep[p.step];
+        await supabase.from('relances_auto').update({
+          step: suivant || p.step,
+          statut: suivant ? 'actif' : 'termine',
+          derniere_relance: new Date().toISOString()
+        }).eq('id', p.id);
+
+        envoyes++;
+      } catch (e) {
+        erreurs++;
+        console.error('Erreur relance pour', p.prospect_local_id, e.message);
+      }
+    }
+
+    res.json({ verifies: actifs.length, traites, envoyes, erreurs });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Serveur Zolva backend démarré sur le port ${PORT}`));
