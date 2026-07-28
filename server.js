@@ -117,14 +117,79 @@ app.post('/api/scan', async (req, res) => {
 
 // --- Route : lister les prospects stockés (celle que Zolva va appeler) ---
 app.get('/api/prospects', async (req, res) => {
-  const { ville, limit = 50 } = req.query;
+  const { ville, categorie, limit = 50 } = req.query;
 
   let q = supabase.from('prospects').select('*').order('created_at', { ascending: false }).limit(Number(limit));
   if (ville) q = q.or(`ville.ilike.%${ville}%,zone_recherche.ilike.%${ville}%`);
+  if (categorie) q = q.eq('categorie', categorie);
 
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+const PERMISAPI_URL = 'https://api.permisapi.fr/v1/permits';
+
+// --- Fonction : interroger PermisAPI pour les maisons individuelles neuves d'un département ---
+async function chercherMaisonsNeuves(depCode) {
+  const url = `${PERMISAPI_URL}?dep_code=${encodeURIComponent(depCode)}&permit_type=PC_LOGEMENT&key=${process.env.PERMISAPI_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`PermisAPI a répondu avec le statut ${res.status}`);
+  }
+  const data = await res.json();
+  return data.data || [];
+}
+
+// --- Route : scanner un département pour les maisons individuelles neuves ---
+app.post('/api/scan-maisons', async (req, res) => {
+  const { dep_code, force } = req.body;
+  if (!dep_code) return res.status(400).json({ error: 'Le paramètre "dep_code" est requis (ex: 33)' });
+  if (!process.env.PERMISAPI_KEY) return res.status(500).json({ error: 'PERMISAPI_KEY non configurée côté serveur' });
+
+  try {
+    if (!force) {
+      const { count } = await supabase
+        .from('prospects')
+        .select('*', { count: 'exact', head: true })
+        .eq('categorie', 'maison_neuve')
+        .ilike('zone_recherche', dep_code);
+
+      if (count && count > 0) {
+        return res.json({ dejaScanne: true, enBase: count, message: 'Département déjà scanné, données existantes utilisées' });
+      }
+    }
+
+    const permis = await chercherMaisonsNeuves(dep_code);
+    let ajoutes = 0, ignores = 0, exclusPro = 0;
+
+    for (const p of permis) {
+      // On exclut les demandeurs professionnels (promoteurs, aménageurs) : leur nom (denom_dem)
+      // ou un SIREN renseigné indique une société, pas un particulier qui décidera lui-même d'une piscine.
+      if (p.denom_dem || p.siren_dem) { exclusPro++; continue; }
+      if (!p.full_address) { ignores++; continue; }
+
+      const { error } = await supabase.from('prospects').upsert({
+        num_pa: p.num_pa,
+        categorie: 'maison_neuve',
+        latitude: p.lat,
+        longitude: p.lng,
+        adresse: p.full_address,
+        ville: p.adr_localite_ter,
+        zone_recherche: dep_code,
+        superficie_terrain: p.superficie_terrain || null,
+        date_autorisation: p.date_reelle_autorisation || null,
+        source: 'permisapi_maison_neuve'
+      }, { onConflict: 'num_pa' });
+
+      if (error) ignores++;
+      else ajoutes++;
+    }
+
+    res.json({ trouves: permis.length, ajoutes, ignores, exclusPro });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/', (req, res) => res.send('Zolva backend actif ✓'));
