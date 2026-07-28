@@ -199,6 +199,54 @@ app.post('/api/scan-maisons', async (req, res) => {
 app.get('/', (req, res) => res.send('Zolva backend actif ✓'));
 
 // ============================================================
+// ESTIMATION IMMOBILIÈRE RÉELLE — DVF (Demandes de Valeurs Foncières, DGFiP)
+// ============================================================
+app.get('/api/valeur-immo', async (req, res) => {
+  const { lat, lon, dist } = req.query;
+  if (!lat || !lon) return res.status(400).json({ error: 'lat et lon sont requis' });
+
+  try {
+    const rayon = dist || 1500; // mètres — élargi si pas assez de résultats
+    const url = `https://api.cquest.org/dvf?lat=${lat}&lon=${lon}&dist=${rayon}&type_local=Maison`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('DVF a répondu ' + r.status);
+    const data = await r.json();
+    const features = data.features || [];
+
+    // On ne garde que les ventes exploitables : maison, prix et surface renseignés et cohérents
+    const ventes = features
+      .map(f => f.properties)
+      .filter(p => p.valeur_fonciere && p.surface_reelle_bati && p.surface_reelle_bati > 20)
+      .map(p => ({
+        prix: Number(p.valeur_fonciere),
+        surface: Number(p.surface_reelle_bati),
+        prixM2: Number(p.valeur_fonciere) / Number(p.surface_reelle_bati),
+        date: p.date_mutation,
+        adresse: [p.adresse_numero, p.adresse_nom_voie].filter(Boolean).join(' ')
+      }))
+      .filter(v => v.prixM2 > 500 && v.prixM2 < 15000); // écarte les valeurs aberrantes (erreurs de saisie DVF)
+
+    if (ventes.length === 0) {
+      return res.json({ trouve: false, message: 'Aucune vente comparable trouvée à proximité dans la base DVF' });
+    }
+
+    const prixM2Tries = ventes.map(v => v.prixM2).sort((a, b) => a - b);
+    const prixM2Median = prixM2Tries[Math.floor(prixM2Tries.length / 2)];
+
+    res.json({
+      trouve: true,
+      prixM2Median: Math.round(prixM2Median),
+      nbTransactions: ventes.length,
+      rayonMetres: Number(rayon),
+      exemples: ventes.slice(0, 5),
+      source: 'DVF — DGFiP (data.gouv.fr)'
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
 // CHATBOT PUBLIC — widget de setting pour le site du pisciniste
 // ============================================================
 function buildSystemPrompt(business) {
