@@ -199,6 +199,37 @@ app.post('/api/scan-maisons', async (req, res) => {
 app.get('/', (req, res) => res.send('Zolva backend actif ✓'));
 
 // ============================================================
+// GÉNÉRATION DE TEXTE IA — passe-plat générique et sécurisé vers Claude
+// ============================================================
+app.post('/api/ai-generate', async (req, res) => {
+  const { system, prompt, maxTokens } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'prompt requis' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY non configurée' });
+
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: maxTokens || 600,
+        ...(system ? { system } : {}),
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    if (!resp.ok) throw new Error('Anthropic a répondu ' + resp.status);
+    const data = await resp.json();
+    res.json({ text: data.content[0].text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
 // ESTIMATION IMMOBILIÈRE RÉELLE — DVF (Demandes de Valeurs Foncières, DGFiP)
 // ============================================================
 app.get('/api/valeur-immo', async (req, res) => {
