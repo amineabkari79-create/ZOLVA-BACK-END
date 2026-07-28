@@ -132,8 +132,10 @@ const PERMISAPI_URL = 'https://api.permisapi.fr/v1/permits';
 
 // --- Fonction : interroger PermisAPI pour les maisons individuelles neuves d'un département ---
 async function chercherMaisonsNeuves(depCode) {
-  const url = `${PERMISAPI_URL}?dep_code=${encodeURIComponent(depCode)}&permit_type=PC_LOGEMENT&key=${process.env.PERMISAPI_KEY}`;
-  const res = await fetch(url);
+  const url = `${PERMISAPI_URL}?dep_code=${encodeURIComponent(depCode)}&permit_type=PC_LOGEMENT`;
+  const res = await fetch(url, {
+    headers: { 'Authorization': 'ApiKey ' + process.env.PERMISAPI_KEY }
+  });
   if (!res.ok) {
     throw new Error(`PermisAPI a répondu avec le statut ${res.status}`);
   }
