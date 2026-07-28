@@ -165,6 +165,7 @@ app.post('/api/scan-maisons', async (req, res) => {
 
     const permis = await chercherMaisonsNeuves(dep_code);
     let ajoutes = 0, ignores = 0, exclusPro = 0;
+    let premiereErreur = null;
 
     for (const p of permis) {
       // On exclut les demandeurs professionnels (promoteurs, aménageurs) : leur nom (denom_dem)
@@ -185,11 +186,11 @@ app.post('/api/scan-maisons', async (req, res) => {
         source: 'permisapi_maison_neuve'
       }, { onConflict: 'num_pa' });
 
-      if (error) ignores++;
+      if (error) { ignores++; if (!premiereErreur) premiereErreur = error.message; }
       else ajoutes++;
     }
 
-    res.json({ trouves: permis.length, ajoutes, ignores, exclusPro });
+    res.json({ trouves: permis.length, ajoutes, ignores, exclusPro, premiereErreur });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
