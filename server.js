@@ -134,10 +134,11 @@ const PERMISAPI_URL = 'https://api.permisapi.fr/v1/permits';
 async function chercherMaisonsNeuves(depCode) {
   const url = `${PERMISAPI_URL}?dep_code=${encodeURIComponent(depCode)}&permit_type=PC_LOGEMENT`;
   const res = await fetch(url, {
-    headers: { 'Authorization': 'ApiKey ' + process.env.PERMISAPI_KEY }
+    headers: { 'X-API-Key': process.env.PERMISAPI_KEY }
   });
   if (!res.ok) {
-    throw new Error(`PermisAPI a répondu avec le statut ${res.status}`);
+    const key = process.env.PERMISAPI_KEY || '';
+    throw new Error(`PermisAPI a répondu avec le statut ${res.status} — clé reçue : longueur=${key.length}, début="${key.slice(0, 8)}", fin="${key.slice(-4)}"`);
   }
   const data = await res.json();
   return data.data || [];
