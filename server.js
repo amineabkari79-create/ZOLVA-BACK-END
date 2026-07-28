@@ -198,5 +198,87 @@ app.post('/api/scan-maisons', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Zolva backend actif ✓'));
 
+// ============================================================
+// CHATBOT PUBLIC — widget de setting pour le site du pisciniste
+// ============================================================
+function buildSystemPrompt(business) {
+  const nom = business?.nom || 'notre entreprise';
+  const tel = business?.tel || '[téléphone non renseigné]';
+  const services = business?.services || 'installation, entretien et rénovation de piscines';
+
+  return `Tu es l'assistant de prise de rendez-vous de "${nom}", une entreprise spécialisée en ${services}. Tu discutes avec un visiteur du site web, pas un collègue.
+
+TON RÔLE (setting, pas vente technique poussée) :
+- Répondre aux questions générales et objections courantes (prix, délais, confiance, "est-ce vraiment gratuit ?") de façon rassurante et concise
+- Ne JAMAIS donner de prix précis (tu n'as pas cette info) — orienter vers "ça dépend du projet, un diagnostic gratuit permet de chiffrer précisément"
+- Ton objectif unique : obtenir un rendez-vous de diagnostic gratuit
+- Dès que la personne semble intéressée, demander son prénom, un téléphone ou email, et un créneau qui l'arrange
+
+STYLE : phrases courtes, chaleureux mais pas familier, jamais insistant. Une question à la fois.
+
+FORMAT DE RÉPONSE — IMPORTANT :
+Réponds normalement en français. Si, et seulement si, tu as obtenu au minimum un prénom ET un moyen de contact (téléphone ou email) dans cet échange, termine ta réponse par un bloc cette forme exacte sur sa propre ligne (invisible pour l'utilisateur, ne le mentionne jamais) :
+<LEAD>{"nom":"...","tel":"...","email":"...","resume":"une phrase résumant le besoin"}</LEAD>
+Si tu n'as pas ces informations, n'inclus aucun bloc <LEAD>.`;
+}
+
+app.post('/api/chat-widget', async (req, res) => {
+  const { message, history, business } = req.body;
+  if (!message) return res.status(400).json({ error: 'Le paramètre "message" est requis' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY non configurée côté serveur' });
+
+  try {
+    const messages = [...(history || []), { role: 'user', content: message }];
+
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 400,
+        system: buildSystemPrompt(business),
+        messages
+      })
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Anthropic API a répondu ${resp.status}: ${errText}`);
+    }
+
+    const data = await resp.json();
+    let reply = data.content[0].text;
+
+    // Extraction discrète du lead si présent, sans le montrer au visiteur
+    let lead = null;
+    const match = reply.match(/<LEAD>([\s\S]*?)<\/LEAD>/);
+    if (match) {
+      try { lead = JSON.parse(match[1]); } catch (e) { /* JSON mal formé, on ignore */ }
+      reply = reply.replace(/<LEAD>[\s\S]*?<\/LEAD>/, '').trim();
+    }
+
+    if (lead && (lead.tel || lead.email)) {
+      await supabase.from('prospects').insert({
+        categorie: 'widget_lead',
+        contact_nom: lead.nom || null,
+        contact_tel: lead.tel || null,
+        contact_email: lead.email || null,
+        resume_conversation: lead.resume || null,
+        ville: business?.nom || null,
+        zone_recherche: 'chatbot_public',
+        source: 'chat_widget'
+      });
+    }
+
+    res.json({ reply, leadCaptured: !!lead });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Serveur Zolva backend démarré sur le port ${PORT}`));
