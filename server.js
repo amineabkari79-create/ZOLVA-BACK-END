@@ -283,8 +283,9 @@ app.post('/api/chat-widget', async (req, res) => {
 // ============================================================
 // ENVOI RÉEL — email (Resend) et SMS (Twilio)
 // ============================================================
-async function envoyerEmail(to, subject, body) {
+async function envoyerEmail(to, subject, body, fromName) {
   if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY non configurée');
+  const nom = (fromName || 'Zolva').replace(/[<>]/g, '');
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -292,7 +293,7 @@ async function envoyerEmail(to, subject, body) {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      from: 'Zolva <onboarding@resend.dev>',
+      from: `${nom} <onboarding@resend.dev>`,
       to: [to],
       subject,
       html: body.replace(/\n/g, '<br>')
@@ -322,10 +323,10 @@ async function envoyerSMS(to, body) {
 
 // --- Route : envoi manuel d'un email (bouton "Envoyer" côté app) ---
 app.post('/api/send-email', async (req, res) => {
-  const { to, subject, body } = req.body;
+  const { to, subject, body, fromName } = req.body;
   if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject et body sont requis' });
   try {
-    await envoyerEmail(to, subject, body);
+    await envoyerEmail(to, subject, body, fromName);
     res.json({ envoye: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -350,7 +351,7 @@ app.post('/api/send-sms', async (req, res) => {
 
 // --- Activer le suivi automatique pour un prospect ---
 app.post('/api/relances/activer', async (req, res) => {
-  const { prospect_local_id, nom, tel, email, canal_prefere, ville, date_contact } = req.body;
+  const { prospect_local_id, nom, tel, email, canal_prefere, ville, date_contact, entreprise_nom, cal_link, style } = req.body;
   if (!prospect_local_id) return res.status(400).json({ error: 'prospect_local_id requis' });
   if (!tel && !email) return res.status(400).json({ error: 'Un téléphone ou un email est requis pour automatiser les relances' });
 
@@ -359,6 +360,9 @@ app.post('/api/relances/activer', async (req, res) => {
     canal_prefere: canal_prefere || (tel ? 'sms' : 'email'),
     ville,
     date_contact: date_contact || new Date().toISOString().slice(0, 10),
+    entreprise_nom: entreprise_nom || null,
+    cal_link: cal_link || null,
+    style: style || 'naturel',
     step: 'j1',
     statut: 'actif'
   }, { onConflict: 'prospect_local_id' });
@@ -384,11 +388,30 @@ app.get('/api/relances/liste', async (req, res) => {
 });
 
 // --- Générer un message de relance via Claude (réutilisé par le job auto) ---
+function styleInstruction(style) {
+  const map = {
+    naturel: 'Ton naturel et neutre, sans technique de vente appuyée.',
+    soft_fomo: 'Utilise une technique de "soft FOMO" SANS mentir : évoque que d\'autres propriétaires du secteur avancent sur leur projet, reste crédible, jamais de fausse urgence artificielle.',
+    soft_urgence: 'Urgence douce et réelle liée à la saisonnalité (délais de construction avant l\'été) — factuel, jamais agressif.',
+    storytelling: 'Utilise un mini-récit concret (client fictif mais réaliste, prénom + détail précis) pour illustrer le bénéfice.',
+    direct: 'Va droit au but, phrases courtes, une seule idée par message.'
+  };
+  return map[style] || map.naturel;
+}
+
 async function genererMessageRelance(step, prospect) {
+  const entreprise = prospect.entreprise_nom || 'notre entreprise';
+  const calLink = prospect.cal_link || '[lien de RDV non configuré]';
+  const styleInstr = styleInstruction(prospect.style);
+  const isSms = prospect.canal_prefere === 'sms';
+  const contrainteFormat = isSms
+    ? 'Format SMS strict : 300 caractères maximum, une seule idée, le lien de RDV DOIT être inclus explicitement.'
+    : 'Format email : 3-5 phrases, le lien de RDV inclus naturellement.';
+
   const prompts = {
-    j1: `Tu es Thomas, setter piscine terrain. Rédige un message de relance J+1 ultra-naturel pour ${prospect.nom || 'le prospect'}. Il a été contacté récemment pour un projet piscine et n'a pas répondu. Style humain, pas commercial, comme si tu vérifies juste qu'il a bien reçu. 3-4 phrases max. Réponds uniquement avec le message, sans lien ni signature.`,
-    j2: `Tu es Thomas, setter piscine terrain. Rédige un message de relance J+2 pour ${prospect.nom || 'le prospect'}. Utilise une preuve sociale : un témoignage fictif mais réaliste d'un propriétaire satisfait dans la région de ${prospect.ville || 'sa région'}. 4-5 phrases max. Réponds uniquement avec le message.`,
-    j3: `Tu es Thomas, setter piscine terrain. Rédige le dernier message de relance J+3 pour ${prospect.nom || 'le prospect'}. Créé une urgence réelle sur la saison de construction. Ton direct mais respectueux. 4 phrases max. Réponds uniquement avec le message.`
+    j1: `Tu rédiges au nom de "${entreprise}" (jamais de prénom fictif type "Thomas"). Message de relance J+1 pour ${prospect.nom || 'le prospect'}, contacté récemment pour un projet piscine, sans réponse. ${styleInstr} ${contrainteFormat} Objectif : obtenir un rendez-vous via ce lien : ${calLink}. Réponds uniquement avec le message.`,
+    j2: `Tu rédiges au nom de "${entreprise}". Message de relance J+2 pour ${prospect.nom || 'le prospect'} (région : ${prospect.ville || 'sa région'}). ${styleInstr} ${contrainteFormat} Objectif : obtenir un rendez-vous via ce lien : ${calLink}. Réponds uniquement avec le message.`,
+    j3: `Tu rédiges au nom de "${entreprise}". Dernier message de relance J+3 pour ${prospect.nom || 'le prospect'}. ${styleInstr} ${contrainteFormat} Objectif : obtenir un rendez-vous via ce lien : ${calLink}. Réponds uniquement avec le message.`
   };
   if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configurée');
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -434,7 +457,7 @@ app.post('/api/relances/run', async (req, res) => {
         if (p.canal_prefere === 'sms' && p.tel) {
           await envoyerSMS(p.tel, message);
         } else if (p.email) {
-          await envoyerEmail(p.email, 'Votre projet piscine', message);
+          await envoyerEmail(p.email, 'Votre projet piscine', message, p.entreprise_nom);
         } else {
           throw new Error('Aucun canal disponible');
         }
@@ -460,4 +483,5 @@ app.post('/api/relances/run', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Serveur Zolva backend démarré sur le port ${PORT}`));
 app.listen(PORT, () => console.log(`Serveur Zolva backend démarré sur le port ${PORT}`));
