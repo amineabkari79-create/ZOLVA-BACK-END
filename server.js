@@ -17,10 +17,12 @@ const supabase = createClient(
 // Le serveur Overpass principal (overpass-api.de) est communautaire et souvent surchargé
 // ("server too busy"). On garde plusieurs miroirs équivalents et on bascule automatiquement
 // sur le suivant si l'un d'eux timeout ou est indisponible.
+// Kumi Systems est un miroir commercial généralement plus stable que les miroirs communautaires
+// (overpass-api.de et son load-balancer lz4 partagent souvent la même surcharge) — on le tente en premier.
 const OVERPASS_URLS = [
-  'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.osm.ch/api/interpreter',
+  'https://overpass-api.de/api/interpreter',
   'https://lz4.overpass-api.de/api/interpreter'
 ];
 const BAN_REVERSE_URL = 'https://api-adresse.data.gouv.fr/reverse/';
@@ -94,30 +96,38 @@ async function chercherPiscines(ville) {
 
   let derniereErreur = null;
   for (const url of OVERPASS_URLS) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 28000);
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: query,
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
+    // Les serveurs Overpass communautaires renvoient parfois une erreur ponctuelle et passagère
+    // (ex: "duplicate_query", "too busy") qui disparaît en réessayant quelques secondes après.
+    // On tente donc chaque serveur jusqu'à 2 fois avant de passer au suivant.
+    for (let tentative = 1; tentative <= 2; tentative++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 28000);
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: query,
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
 
-      if (!res.ok) { derniereErreur = new Error(`${url} a répondu ${res.status}`); continue; }
+        if (!res.ok) { derniereErreur = new Error(`${url} a répondu ${res.status}`); throw derniereErreur; }
 
-      const data = await res.json();
-      // Overpass renvoie parfois du 200 OK avec un message d'erreur dans le corps (serveur surchargé)
-      if (data.remark && /error|timeout|too busy/i.test(data.remark)) {
-        derniereErreur = new Error(`${url} : ${data.remark}`);
-        continue;
+        const data = await res.json();
+        // Overpass renvoie parfois du 200 OK avec un message d'erreur dans le corps (serveur surchargé)
+        if (data.remark && /error|timeout|too busy|duplicate/i.test(data.remark)) {
+          derniereErreur = new Error(`${url} : ${data.remark}`);
+          throw derniereErreur;
+        }
+        console.log(`[chercherPiscines] "${ville}" → serveur utilisé: ${url} (tentative ${tentative}) → ${(data.elements || []).length} éléments bruts`);
+        return { elements: data.elements || [], serveur: url };
+      } catch (err) {
+        derniereErreur = err;
+        if (tentative === 1) {
+          await new Promise(r => setTimeout(r, 4000)); // petite pause avant de réessayer ce même serveur
+        }
+        // sinon on passe au serveur suivant
       }
-      console.log(`[chercherPiscines] "${ville}" → serveur utilisé: ${url} → ${(data.elements || []).length} éléments bruts`);
-      return { elements: data.elements || [], serveur: url };
-    } catch (err) {
-      derniereErreur = err;
-      // on essaie le miroir suivant
     }
   }
   throw derniereErreur || new Error('Tous les serveurs Overpass sont indisponibles');
@@ -162,7 +172,29 @@ app.post('/api/scan', checkAccessCode, async (req, res) => {
       }
     }
 
-    const { elements, serveur } = await chercherPiscines(ville);
+    let elements, serveur;
+    try {
+      ({ elements, serveur } = await chercherPiscines(ville));
+    } catch (overpassErr) {
+      // Tous les serveurs Overpass ont échoué à cet instant précis (infrastructure communautaire
+      // parfois instable). Plutôt que de renvoyer une erreur brutale ou 0 prospect, on retombe sur
+      // les données déjà en base pour ce testeur/cette zone, si elles existent.
+      const { data: dejaConnu, count } = await supabase
+        .from('prospects')
+        .select('*', { count: 'exact' })
+        .eq('owner', req.owner)
+        .ilike('zone_recherche', ville);
+
+      if (count && count > 0) {
+        return res.json({
+          dejaScanne: true,
+          enBase: count,
+          overpassIndisponible: true,
+          message: 'Les serveurs OpenStreetMap sont momentanément indisponibles, affichage des données déjà connues pour cette zone'
+        });
+      }
+      throw overpassErr;
+    }
     let ajoutes = 0;
     let ignores = 0;
 
