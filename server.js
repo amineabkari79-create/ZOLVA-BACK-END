@@ -17,6 +17,36 @@ const supabase = createClient(
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
 const BAN_REVERSE_URL = 'https://api-adresse.data.gouv.fr/reverse/';
 
+// ============================================================
+// ACCÈS BÊTA — codes d'accès partagés (pas de vrais comptes, juste un filtre)
+// ============================================================
+// ACCESS_CODES = variable d'environnement Render, format : "CODE1,CODE2,CODE3"
+const ACCESS_CODES = (process.env.ACCESS_CODES || '').split(',').map(s => s.trim()).filter(Boolean);
+
+function checkAccessCode(req, res, next) {
+  const code = req.header('x-access-code');
+  if (!code || !ACCESS_CODES.includes(code)) {
+    return res.status(401).json({ error: 'Code d\'accès invalide ou manquant' });
+  }
+  req.owner = code; // sert à cloisonner les données de chaque testeur
+  next();
+}
+
+// Vérifie qu'un code est valide (appelé par l'écran de connexion du front)
+app.get('/api/auth/check', checkAccessCode, (req, res) => {
+  res.json({ ok: true, owner: req.owner });
+});
+
+// Protège le job cron (/api/relances/run) avec un secret différent des codes d'accès,
+// puisqu'il est appelé par un service externe (cron-job.org), pas par un utilisateur connecté.
+function checkCronSecret(req, res, next) {
+  const secret = req.header('x-cron-secret') || req.query.secret;
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Non autorisé' });
+  }
+  next();
+}
+
 // --- Fonction : interroger Overpass pour une ville donnée ---
 async function chercherPiscines(ville) {
   const query = `
@@ -63,17 +93,18 @@ async function reverseGeocode(lat, lon) {
 }
 
 // --- Route : lancer une recherche pour une ville et stocker les résultats ---
-app.post('/api/scan', async (req, res) => {
+app.post('/api/scan', checkAccessCode, async (req, res) => {
   const { ville, force } = req.body;
   if (!ville) return res.status(400).json({ error: 'Le paramètre "ville" est requis' });
 
   try {
-    // Si cette zone a déjà été scannée récemment, on ne refait pas tout le travail —
+    // Si cette zone a déjà été scannée récemment par ce testeur, on ne refait pas tout le travail —
     // on renvoie directement ce qui est déjà en base (rapide).
     if (!force) {
       const { count } = await supabase
         .from('prospects')
         .select('*', { count: 'exact', head: true })
+        .eq('owner', req.owner)
         .ilike('zone_recherche', ville);
 
       if (count && count > 0) {
@@ -94,13 +125,14 @@ app.post('/api/scan', async (req, res) => {
 
       const { error } = await supabase.from('prospects').upsert({
         osm_id: el.id,
+        owner: req.owner,
         latitude: lat,
         longitude: lon,
         adresse: adresseInfo?.adresse ?? null,
         code_postal: adresseInfo?.code_postal ?? null,
         ville: adresseInfo?.ville ?? ville,
         zone_recherche: ville
-      }, { onConflict: 'osm_id' });
+      }, { onConflict: 'osm_id,owner' });
 
       if (error) ignores++;
       else ajoutes++;
@@ -116,10 +148,10 @@ app.post('/api/scan', async (req, res) => {
 });
 
 // --- Route : lister les prospects stockés (celle que Zolva va appeler) ---
-app.get('/api/prospects', async (req, res) => {
+app.get('/api/prospects', checkAccessCode, async (req, res) => {
   const { ville, categorie, limit = 50 } = req.query;
 
-  let q = supabase.from('prospects').select('*').order('created_at', { ascending: false }).limit(Number(limit));
+  let q = supabase.from('prospects').select('*').eq('owner', req.owner).order('created_at', { ascending: false }).limit(Number(limit));
   if (ville) q = q.or(`ville.ilike.%${ville}%,zone_recherche.ilike.%${ville}%`);
   if (categorie) q = q.eq('categorie', categorie);
 
@@ -137,15 +169,14 @@ async function chercherMaisonsNeuves(depCode) {
     headers: { 'X-API-Key': process.env.PERMISAPI_KEY }
   });
   if (!res.ok) {
-    const key = process.env.PERMISAPI_KEY || '';
-    throw new Error(`PermisAPI a répondu avec le statut ${res.status} — clé reçue : longueur=${key.length}, début="${key.slice(0, 8)}", fin="${key.slice(-4)}"`);
+    throw new Error(`PermisAPI a répondu avec le statut ${res.status}`);
   }
   const data = await res.json();
   return data.data || [];
 }
 
 // --- Route : scanner un département pour les maisons individuelles neuves ---
-app.post('/api/scan-maisons', async (req, res) => {
+app.post('/api/scan-maisons', checkAccessCode, async (req, res) => {
   const { dep_code, force } = req.body;
   if (!dep_code) return res.status(400).json({ error: 'Le paramètre "dep_code" est requis (ex: 33)' });
   if (!process.env.PERMISAPI_KEY) return res.status(500).json({ error: 'PERMISAPI_KEY non configurée côté serveur' });
@@ -156,6 +187,7 @@ app.post('/api/scan-maisons', async (req, res) => {
         .from('prospects')
         .select('*', { count: 'exact', head: true })
         .eq('categorie', 'maison_neuve')
+        .eq('owner', req.owner)
         .ilike('zone_recherche', dep_code);
 
       if (count && count > 0) {
@@ -175,6 +207,7 @@ app.post('/api/scan-maisons', async (req, res) => {
 
       const { error } = await supabase.from('prospects').upsert({
         num_pa: p.num_pa,
+        owner: req.owner,
         categorie: 'maison_neuve',
         latitude: p.lat,
         longitude: p.lng,
@@ -184,7 +217,7 @@ app.post('/api/scan-maisons', async (req, res) => {
         superficie_terrain: p.superficie_terrain || null,
         date_autorisation: p.date_reelle_autorisation || null,
         source: 'permisapi_maison_neuve'
-      }, { onConflict: 'num_pa' });
+      }, { onConflict: 'num_pa,owner' });
 
       if (error) { ignores++; if (!premiereErreur) premiereErreur = error.message; }
       else ajoutes++;
@@ -201,12 +234,13 @@ app.get('/', (req, res) => res.send('Zolva backend actif ✓'));
 // ============================================================
 // GÉNÉRATION DE TEXTE IA — passe-plat générique et sécurisé vers Claude
 // ============================================================
-app.post('/api/ai-generate', async (req, res) => {
-  const { system, prompt, maxTokens } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'prompt requis' });
+app.post('/api/ai-generate', checkAccessCode, async (req, res) => {
+  const { system, prompt, maxTokens, history } = req.body;
+  if (!prompt && !history) return res.status(400).json({ error: 'prompt requis' });
   if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY non configurée' });
 
   try {
+    const messages = history && history.length ? history : [{ role: 'user', content: prompt }];
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -218,7 +252,7 @@ app.post('/api/ai-generate', async (req, res) => {
         model: 'claude-sonnet-4-5-20250929',
         max_tokens: maxTokens || 600,
         ...(system ? { system } : {}),
-        messages: [{ role: 'user', content: prompt }]
+        messages
       })
     });
     if (!resp.ok) throw new Error('Anthropic a répondu ' + resp.status);
@@ -232,7 +266,7 @@ app.post('/api/ai-generate', async (req, res) => {
 // ============================================================
 // ESTIMATION IMMOBILIÈRE RÉELLE — DVF (Demandes de Valeurs Foncières, DGFiP)
 // ============================================================
-app.get('/api/valeur-immo', async (req, res) => {
+app.get('/api/valeur-immo', checkAccessCode, async (req, res) => {
   const { lat, lon, dist } = req.query;
   if (!lat || !lon) return res.status(400).json({ error: 'lat et lon sont requis' });
 
@@ -343,6 +377,7 @@ app.post('/api/chat-widget', async (req, res) => {
     if (lead && (lead.tel || lead.email)) {
       await supabase.from('prospects').insert({
         categorie: 'widget_lead',
+        owner: business?.owner || null,
         contact_nom: lead.nom || null,
         contact_tel: lead.tel || null,
         contact_email: lead.email || null,
@@ -362,21 +397,26 @@ app.post('/api/chat-widget', async (req, res) => {
 // ============================================================
 // ENVOI RÉEL — email (Resend) et SMS (Twilio)
 // ============================================================
-async function envoyerEmail(to, subject, body, fromName) {
+async function envoyerEmail(to, subject, body, fromName, replyTo) {
   if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY non configurée');
   const nom = (fromName || 'Zolva').replace(/[<>]/g, '');
+  const payload = {
+    from: `${nom} <onboarding@resend.dev>`,
+    to: [to],
+    subject,
+    html: body.replace(/\n/g, '<br>')
+  };
+  // Le mail part toujours de l'adresse partagée Zolva (nécessaire tant qu'aucun domaine
+  // propre n'est vérifié sur Resend), mais une réponse du prospect atterrit directement
+  // dans la boîte mail réelle du pisciniste grâce au reply-to.
+  if (replyTo) payload.reply_to = replyTo;
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       'Authorization': 'Bearer ' + process.env.RESEND_API_KEY,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      from: `${nom} <onboarding@resend.dev>`,
-      to: [to],
-      subject,
-      html: body.replace(/\n/g, '<br>')
-    })
+    body: JSON.stringify(payload)
   });
   if (!res.ok) throw new Error('Resend a répondu ' + res.status + ': ' + await res.text());
   return await res.json();
@@ -401,11 +441,11 @@ async function envoyerSMS(to, body) {
 }
 
 // --- Route : envoi manuel d'un email (bouton "Envoyer" côté app) ---
-app.post('/api/send-email', async (req, res) => {
-  const { to, subject, body, fromName } = req.body;
+app.post('/api/send-email', checkAccessCode, async (req, res) => {
+  const { to, subject, body, fromName, replyTo } = req.body;
   if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject et body sont requis' });
   try {
-    await envoyerEmail(to, subject, body, fromName);
+    await envoyerEmail(to, subject, body, fromName, replyTo);
     res.json({ envoye: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -413,7 +453,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // --- Route : envoi manuel d'un SMS ---
-app.post('/api/send-sms', async (req, res) => {
+app.post('/api/send-sms', checkAccessCode, async (req, res) => {
   const { to, body } = req.body;
   if (!to || !body) return res.status(400).json({ error: 'to et body sont requis' });
   try {
@@ -429,39 +469,42 @@ app.post('/api/send-sms', async (req, res) => {
 // ============================================================
 
 // --- Activer le suivi automatique pour un prospect ---
-app.post('/api/relances/activer', async (req, res) => {
-  const { prospect_local_id, nom, tel, email, canal_prefere, ville, date_contact, entreprise_nom, cal_link, style } = req.body;
+app.post('/api/relances/activer', checkAccessCode, async (req, res) => {
+  const { prospect_local_id, nom, tel, email, canal_prefere, ville, date_contact, entreprise_nom, cal_link, style, reply_to } = req.body;
   if (!prospect_local_id) return res.status(400).json({ error: 'prospect_local_id requis' });
   if (!tel && !email) return res.status(400).json({ error: 'Un téléphone ou un email est requis pour automatiser les relances' });
 
   const { error } = await supabase.from('relances_auto').upsert({
-    prospect_local_id, nom, tel, email,
+    prospect_local_id,
+    owner: req.owner,
+    nom, tel, email,
     canal_prefere: canal_prefere || (tel ? 'sms' : 'email'),
     ville,
     date_contact: date_contact || new Date().toISOString().slice(0, 10),
     entreprise_nom: entreprise_nom || null,
     cal_link: cal_link || null,
+    reply_to: reply_to || null,
     style: style || 'naturel',
     step: 'j1',
     statut: 'actif'
-  }, { onConflict: 'prospect_local_id' });
+  }, { onConflict: 'prospect_local_id,owner' });
 
   if (error) return res.status(500).json({ error: error.message });
   res.json({ active: true });
 });
 
 // --- Désactiver le suivi automatique ---
-app.post('/api/relances/desactiver', async (req, res) => {
+app.post('/api/relances/desactiver', checkAccessCode, async (req, res) => {
   const { prospect_local_id } = req.body;
   if (!prospect_local_id) return res.status(400).json({ error: 'prospect_local_id requis' });
-  const { error } = await supabase.from('relances_auto').update({ statut: 'desactive' }).eq('prospect_local_id', prospect_local_id);
+  const { error } = await supabase.from('relances_auto').update({ statut: 'desactive' }).eq('prospect_local_id', prospect_local_id).eq('owner', req.owner);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ desactive: true });
 });
 
 // --- Lister les prospects sous suivi automatique (pour affichage dans l'app) ---
-app.get('/api/relances/liste', async (req, res) => {
-  const { data, error } = await supabase.from('relances_auto').select('*').order('created_at', { ascending: false });
+app.get('/api/relances/liste', checkAccessCode, async (req, res) => {
+  const { data, error } = await supabase.from('relances_auto').select('*').eq('owner', req.owner).order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -512,7 +555,7 @@ async function genererMessageRelance(step, prospect) {
 }
 
 // --- Job quotidien : à déclencher par un service de cron externe (ex: cron-job.org) ---
-app.post('/api/relances/run', async (req, res) => {
+app.post('/api/relances/run', checkCronSecret, async (req, res) => {
   try {
     const { data: actifs, error } = await supabase.from('relances_auto').select('*').eq('statut', 'actif');
     if (error) throw error;
@@ -536,7 +579,7 @@ app.post('/api/relances/run', async (req, res) => {
         if (p.canal_prefere === 'sms' && p.tel) {
           await envoyerSMS(p.tel, message);
         } else if (p.email) {
-          await envoyerEmail(p.email, 'Votre projet piscine', message, p.entreprise_nom);
+          await envoyerEmail(p.email, 'Votre projet piscine', message, p.entreprise_nom, p.reply_to);
         } else {
           throw new Error('Aucun canal disponible');
         }
