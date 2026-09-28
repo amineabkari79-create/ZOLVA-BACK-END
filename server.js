@@ -76,9 +76,16 @@ async function chercherPiscines(ville) {
   // tous les serveurs Overpass, ce qui pouvait renvoyer 0 résultat sans aucune erreur.
   const { lat, lon } = await geocoderVille(ville);
   const rayon = 12000; // 12 km autour du centre-ville — couvre la commune et ses environs proches
+  // IMPORTANT : une piscine peut être cartographiée dans OSM sous 3 formes différentes :
+  // - "node" (un simple point) : très fréquent pour les piscines résidentielles mappées rapidement
+  // - "way" (un contour/polygone) : le plus fréquent pour les piscines bien détaillées
+  // - "relation" (forme complexe/multipolygone) : plus rare
+  // Ne chercher que way+relation (comme avant) ratait toutes les piscines mappées en point,
+  // ce qui pouvait faire remonter 0 résultat même quand Overpass répondait correctement.
   const query = `
     [out:json][timeout:25];
     (
+      node["leisure"="swimming_pool"](around:${rayon},${lat},${lon});
       way["leisure"="swimming_pool"](around:${rayon},${lat},${lon});
       relation["leisure"="swimming_pool"](around:${rayon},${lat},${lon});
     );
@@ -106,7 +113,8 @@ async function chercherPiscines(ville) {
         derniereErreur = new Error(`${url} : ${data.remark}`);
         continue;
       }
-      return data.elements || [];
+      console.log(`[chercherPiscines] "${ville}" → serveur utilisé: ${url} → ${(data.elements || []).length} éléments bruts`);
+      return { elements: data.elements || [], serveur: url };
     } catch (err) {
       derniereErreur = err;
       // on essaie le miroir suivant
@@ -154,7 +162,7 @@ app.post('/api/scan', checkAccessCode, async (req, res) => {
       }
     }
 
-    const elements = await chercherPiscines(ville);
+    const { elements, serveur } = await chercherPiscines(ville);
     let ajoutes = 0;
     let ignores = 0;
 
@@ -183,7 +191,7 @@ app.post('/api/scan', checkAccessCode, async (req, res) => {
       await new Promise(r => setTimeout(r, 150));
     }
 
-    res.json({ trouves: elements.length, ajoutes, ignores });
+    res.json({ trouves: elements.length, ajoutes, ignores, serveurUtilise: serveur });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
