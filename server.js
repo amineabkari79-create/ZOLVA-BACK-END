@@ -24,6 +24,19 @@ const OVERPASS_URLS = [
   'https://lz4.overpass-api.de/api/interpreter'
 ];
 const BAN_REVERSE_URL = 'https://api-adresse.data.gouv.fr/reverse/';
+const BAN_SEARCH_URL = 'https://api-adresse.data.gouv.fr/search/';
+
+// --- Fonction : convertir un nom de ville en coordonnées GPS (API BAN, gratuite) ---
+async function geocoderVille(ville) {
+  const url = `${BAN_SEARCH_URL}?q=${encodeURIComponent(ville)}&type=municipality&limit=1`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Géocodage de la ville échoué (' + res.status + ')');
+  const data = await res.json();
+  const feature = data.features?.[0];
+  if (!feature) throw new Error(`Ville "${ville}" introuvable`);
+  const [lon, lat] = feature.geometry.coordinates;
+  return { lat, lon };
+}
 
 // ============================================================
 // ACCÈS BÊTA — codes d'accès partagés (pas de vrais comptes, juste un filtre)
@@ -57,12 +70,17 @@ function checkCronSecret(req, res, next) {
 
 // --- Fonction : interroger Overpass pour une ville donnée (avec bascule automatique sur les miroirs) ---
 async function chercherPiscines(ville) {
+  // On géolocalise la ville en coordonnées GPS puis on cherche dans un rayon autour,
+  // plutôt que de chercher par nom de zone administrative : cette dernière méthode dépend
+  // d'un index ("area") qui n'est pas toujours à jour ou disponible de façon identique sur
+  // tous les serveurs Overpass, ce qui pouvait renvoyer 0 résultat sans aucune erreur.
+  const { lat, lon } = await geocoderVille(ville);
+  const rayon = 12000; // 12 km autour du centre-ville — couvre la commune et ses environs proches
   const query = `
     [out:json][timeout:25];
-    area["name"="${ville}"]["boundary"="administrative"]->.a;
     (
-      way["leisure"="swimming_pool"](area.a);
-      relation["leisure"="swimming_pool"](area.a);
+      way["leisure"="swimming_pool"](around:${rayon},${lat},${lon});
+      relation["leisure"="swimming_pool"](around:${rayon},${lat},${lon});
     );
     out center;
   `;
