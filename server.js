@@ -20,6 +20,7 @@ const supabase = createClient(
 // Kumi Systems est un miroir commercial généralement plus stable que les miroirs communautaires
 // (overpass-api.de et son load-balancer lz4 partagent souvent la même surcharge) — on le tente en premier.
 const OVERPASS_URLS = [
+  'https://overpass.openstreetmap.fr/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.osm.ch/api/interpreter',
   'https://overpass-api.de/api/interpreter',
