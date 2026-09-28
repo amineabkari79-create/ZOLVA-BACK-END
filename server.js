@@ -14,7 +14,15 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+// Le serveur Overpass principal (overpass-api.de) est communautaire et souvent surchargé
+// ("server too busy"). On garde plusieurs miroirs équivalents et on bascule automatiquement
+// sur le suivant si l'un d'eux timeout ou est indisponible.
+const OVERPASS_URLS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.osm.ch/api/interpreter',
+  'https://lz4.overpass-api.de/api/interpreter'
+];
 const BAN_REVERSE_URL = 'https://api-adresse.data.gouv.fr/reverse/';
 
 // ============================================================
@@ -47,10 +55,10 @@ function checkCronSecret(req, res, next) {
   next();
 }
 
-// --- Fonction : interroger Overpass pour une ville donnée ---
+// --- Fonction : interroger Overpass pour une ville donnée (avec bascule automatique sur les miroirs) ---
 async function chercherPiscines(ville) {
   const query = `
-    [out:json][timeout:50];
+    [out:json][timeout:25];
     area["name"="${ville}"]["boundary"="administrative"]->.a;
     (
       way["leisure"="swimming_pool"](area.a);
@@ -59,18 +67,34 @@ async function chercherPiscines(ville) {
     out center;
   `;
 
-  const res = await fetch(OVERPASS_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: query
-  });
+  let derniereErreur = null;
+  for (const url of OVERPASS_URLS) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 28000);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: query,
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-  if (!res.ok) {
-    throw new Error(`Overpass a répondu avec le statut ${res.status}`);
+      if (!res.ok) { derniereErreur = new Error(`${url} a répondu ${res.status}`); continue; }
+
+      const data = await res.json();
+      // Overpass renvoie parfois du 200 OK avec un message d'erreur dans le corps (serveur surchargé)
+      if (data.remark && /error|timeout|too busy/i.test(data.remark)) {
+        derniereErreur = new Error(`${url} : ${data.remark}`);
+        continue;
+      }
+      return data.elements || [];
+    } catch (err) {
+      derniereErreur = err;
+      // on essaie le miroir suivant
+    }
   }
-
-  const data = await res.json();
-  return data.elements || [];
+  throw derniereErreur || new Error('Tous les serveurs Overpass sont indisponibles');
 }
 
 // --- Fonction : retrouver l'adresse approximative d'une coordonnée (API BAN, gratuite) ---
